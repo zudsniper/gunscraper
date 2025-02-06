@@ -2,3 +2,5 @@
 scraping_results*
 listing_analysis.json
 page_count_cache.json
+
+__pycache__
