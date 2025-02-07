@@ -4,12 +4,116 @@ import json
 from dotenv import load_dotenv
 from scrapegraphai.graphs import SmartScraperGraph
 from scrapegraphai.utils import prettify_exec_info
-from scrapegraphai.models.oneapi import OneApi
 from models import ListingPreviews, ListingsPages, ListingsPage
 from pydantic import BaseModel, Field
-from langchain_openai import ChatOpenAI
 from datetime import datetime
 import traceback
+from langchain_community.chat_models import ChatOpenAI
+from enum import Enum
+from typing import Optional, Dict, Any, Tuple
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_result
+import time
+
+listing_page_prompt = """
+Extract all listings from this page. 
+For each listing, identify the type of item(s) and extract relevant information:
+
+- title
+- price
+- description
+- items: List of items in the listing, each with:
+    - item_type: gun, magazine, ammunition, optic, light, holster, body_armor, or other
+    - manufacturer
+    - model
+    - caliber (for guns, magazines, ammunition)
+    - condition (for guns)
+    - capacity (for magazines)
+    - quantity (for ammunition)
+- image_urls
+- listing_url
+"""
+
+class LLMProvider(str, Enum):
+    OPENROUTER = "openrouter"
+    LANGCHAIN = "langchain"
+
+def get_graph_config(
+    provider: LLMProvider = LLMProvider.OPENROUTER,
+    model: str = "openai/gpt-4o-mini",
+    model_instance: Optional[Any] = None,
+    verbose: bool = True,
+    headless: bool = False,
+    use_proxy: bool = True,
+    **kwargs
+) -> Dict:
+    """
+    Get configuration for SmartScraperGraph based on provider type
+    
+    Args:
+        provider: LLM provider to use (openrouter or langchain)
+        model: Model identifier (for OpenRouter)
+        model_instance: Pre-configured LangChain model instance
+        verbose: Enable verbose logging
+        headless: Run browser in headless mode
+        use_proxy: Whether to use proxy settings from env
+        **kwargs: Additional configuration options
+    
+    Returns:
+        Dictionary containing graph configuration
+    """
+    
+    # Base configuration
+    config = {
+        "verbose": verbose,
+        "headless": headless,
+        "browser_name": "chromium",
+        "backend": "undetected_chromedriver",
+    }
+    
+    # Add proxy configuration if enabled
+    if use_proxy:
+        proxy_server = os.getenv("PROXY_SERVER")
+        proxy_username = os.getenv("PROXY_USERNAME")
+        proxy_password = os.getenv("PROXY_PASSWORD")
+        
+        if proxy_server and proxy_username and proxy_password:
+            config["loader_kwargs"] = {
+                "proxy": {
+                    "server": proxy_server,
+                    "username": proxy_username,
+                    "password": proxy_password,
+                }
+            }
+    
+    # Add provider-specific LLM configuration
+    if provider == LLMProvider.OPENROUTER:
+        config["llm"] = {
+            "api_key": os.getenv("OPENROUTER_KEY"),
+            "model": model,
+            "base_url": "https://openrouter.ai/api/v1",
+        }
+    
+    elif provider == LLMProvider.LANGCHAIN:
+        if not model_instance:
+            # Default to OpenAI via LangChain if no instance provided
+            model_instance = ChatOpenAI(
+                openai_api_key=os.getenv("OPENROUTER_KEY"),
+                openai_api_base="https://openrouter.ai/api/v1",
+                model_name=model
+            )
+        
+        config["llm"] = {
+            "model_instance": model_instance,
+            "model_tokens": kwargs.get("model_tokens", 4096)  # Default token limit
+        }
+    
+    else:
+        raise ValueError(f"Unsupported LLM provider: {provider}")
+    
+    # Add any additional configuration
+    config.update(kwargs)
+    
+    return config
 
 def get_page_count(url: str, config: dict) -> tuple[int, dict]:
     """Get total page count, either from cache or by scraping"""
@@ -75,7 +179,84 @@ def save_progress(result: dict, start_time: datetime, output_path: Path = Path("
         json.dump(result, f, indent=4)
     print(f"\nProgress saved to {output_path}")
 
-def run_scraper(url: str, result: dict, start_time: datetime) -> dict:
+def is_empty_listings(result: Tuple[Any, Dict]) -> bool:
+    """Check if the listings result is empty or invalid"""
+    listing_previews, _ = result
+    
+    # Check if we got a valid response
+    if not listing_previews:
+        print("Got null response")
+        return True
+        
+    # Check if it's a dict (raw response) instead of parsed model
+    if isinstance(listing_previews, dict):
+        try:
+            # Check if the dict has valid listings
+            listings = listing_previews.get('listings', [])
+            if listings and len(listings) > 0:
+                print(f"Found {len(listings)} listings in raw dict")
+                return False
+        except Exception as e:
+            print(f"Error checking raw dict listings: {str(e)}")
+        print("Got empty or invalid raw dict")
+        return True
+        
+    # Check if listings exist and aren't empty
+    try:
+        listings_count = len(listing_previews.listings)
+        print(f"Found {listings_count} listings")
+        return listings_count == 0
+    except (AttributeError, TypeError) as e:
+        print(f"Error checking listings: {str(e)}")
+        return True
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_result(is_empty_listings)
+)
+def scrape_page(page_url: str, graph_config: Dict) -> Tuple[Optional[ListingPreviews], Dict]:
+    """
+    Scrape a single page with retry logic
+    
+    Returns:
+        Tuple of (ListingPreviews, execution_info)
+    """
+    print(f'Attempting to scrape {page_url}')
+    
+    try:
+        smart_scraper_graph = SmartScraperGraph(
+            prompt=listing_page_prompt,
+            source=page_url,
+            config=graph_config,
+            schema=ListingPreviews,
+        )
+
+        listing_previews = smart_scraper_graph.run()
+        exec_info = smart_scraper_graph.get_execution_info()
+        
+        if not listing_previews:
+            print("No listings found, will retry...")
+            return None, exec_info
+            
+        # Ensure we have a ListingPreviews model
+        if isinstance(listing_previews, dict):
+            try:
+                listing_previews = ListingPreviews(**listing_previews)
+            except Exception as e:
+                print(f"Error converting dict to ListingPreviews: {str(e)}")
+                return None, exec_info
+            
+        if not listing_previews.listings:
+            print("Empty listings found, will retry...")
+            
+        return listing_previews, exec_info
+        
+    except Exception as e:
+        print(f"Error during page scrape: {str(e)}")
+        return None, {}
+
+def run_scraper(url: str, result: dict, start_time: datetime, graph_config: Optional[Dict] = None) -> dict:
     """Run scraper for a single URL"""
     output_path = Path("scraping_results.json")
     start_page = 1
@@ -88,31 +269,10 @@ def run_scraper(url: str, result: dict, start_time: datetime) -> dict:
                 start_page = previous_run["last_completed_page"] + 1
                 execution_info = previous_run["execution_info"]
                 print(f"Resuming from page {start_page}")
-
-    graph_config = {
-        "llm": {
-            "api_key": os.getenv("OPENROUTER_KEY"),
-            "model": "openai/gpt-4o-mini",
-            "base_url": "https://openrouter.ai/api/v1",
-        },
-        "verbose": True,
-        "headless": False,
-    }
     
-    listing_page_prompt = """
-    Extract all listings from this page. 
-    For each listing, extract the following:
-    - title
-    - price
-    - description: a description of the listing 
-    - guns: all the firearms listed
-      - manufacturer
-      - model 
-      - caliber 
-      - condition: new, like new, used
-    - image_urls: Capture all image URLs 
-    - listing_url: the URL of the detailed listing
-    """
+    # Use default OpenRouter config if none provided
+    if graph_config is None:
+        graph_config = get_graph_config(use_proxy=True)
 
     # Get page count (cached or fresh)
     last_page, exec_info = get_page_count(url, graph_config)
@@ -136,38 +296,30 @@ def run_scraper(url: str, result: dict, start_time: datetime) -> dict:
         page_url = f"{base_url}{page_num}.html"
         print(f'Scraping page {page_num} of {last_page}')
         
-        smart_scraper_graph = SmartScraperGraph(
-            prompt=listing_page_prompt,
-            source=page_url,
-            config=graph_config,
-            schema=ListingPreviews,
-        )
-
-        listing_previews = smart_scraper_graph.run()
-        execution_info.append(smart_scraper_graph.get_execution_info())
-        
-        new_page = ListingsPage(
-            page_url=page_url,
-            page_number=page_num,
-            listing_previews=listing_previews
-        )
-        pages.pages.append(new_page)
-        
-        # # Print the data as we get it
-        # print("\nNew listings found:")
-        # for listing in listing_previews.listings:
-        #     print(f"\nTitle: {listing.title}")
-        #     print(f"Price: {listing.price}")
-        #     for gun in listing.guns:
-        #         print(f"Gun: {gun.manufacturer} {gun.model} ({gun.caliber})")
-        
-        # Update result data and save progress
-        result["data"] = pages.model_dump()
-        result["last_completed_page"] = page_num
-        save_progress(result, start_time)
-        
-        print(execution_info[-1])
-        print('done, next page...')
+        try:
+            listing_previews, exec_info = scrape_page(page_url, graph_config)
+            execution_info.append(exec_info)
+            
+            new_page = ListingsPage(
+                page_url=page_url,
+                page_number=page_num,
+                listing_previews=listing_previews
+            )
+            pages.pages.append(new_page)
+            
+            # Update result data and save progress
+            result["data"] = pages.model_dump()
+            result["last_completed_page"] = page_num
+            save_progress(result, start_time)
+            
+            # Use prettify_exec_info for better formatting
+            print(prettify_exec_info(exec_info))
+            print('done, next page...')
+            
+        except Exception as e:
+            print(f"Error scraping page {page_num}: {str(e)}")
+            print("Continuing to next page...")
+            continue
 
     return {
         "result": pages.model_dump(),
@@ -182,12 +334,39 @@ def main():
     url = "https://austin.texasguntrader.com/GUNS-FOR-SALE/548/For-Sale-Trade.html"
     result = create_result_template(url, start_time)
     
+    # Example configurations:
+    
+    # 1. Default OpenRouter config with proxy
+    default_config = get_graph_config(use_proxy=False)
+    
+    # 2. OpenRouter with different model and proxy
+    gpt4_config = get_graph_config(
+        model="openai/gpt-4-turbo-preview",
+        temperature=0.7,
+        use_proxy=False
+    )
+    
+    # 3. LangChain with custom model and proxy
+    # from langchain_community.chat_models.moonshot import MoonshotChat
+    # moonshot_model = MoonshotChat(
+    #     model="moonshot-v1-8k",
+    #     base_url="https://api.moonshot.cn/v1",
+    #     moonshot_api_key=os.getenv("MOONSHOT_API_KEY")
+    # )
+    # moonshot_config = get_graph_config(
+    #     provider=LLMProvider.LANGCHAIN,
+    #     model_instance=moonshot_model,
+    #     model_tokens=8192,
+    #     use_proxy=True
+    # )
+    
     try:
         print(f"Processing URL: {url}")
-        scrape_result = run_scraper(url, result, start_time)
+        # Choose which config to use
+        scrape_result = run_scraper(url, result, start_time, graph_config=default_config)
         
         result["status"] = "completed"
-        result["data"] = scrape_result["result"]  # This now contains the actual data
+        result["data"] = scrape_result["result"]
         result["execution_info"] = scrape_result["execution_info"]
         
     except Exception as e:

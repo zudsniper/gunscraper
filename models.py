@@ -81,21 +81,57 @@ class Listing(BaseModel):
 class Listings(BaseModel):
     listings: List[Listing] = Field(description="List of all listings found on the page")
 
-class GunPreview(BaseModel):
-    manufacturer: str
-    model: str
-    caliber: str
+class ItemPreview(BaseModel):
+    """Base preview model for any item type"""
+    item_type: ItemType
+    manufacturer: Optional[str] = None
+    model: Optional[str] = None
+    description: Optional[str] = None
+
+class GunPreview(ItemPreview):
+    """Preview information for guns"""
+    item_type: ItemType = ItemType.GUN
+    caliber: Optional[str] = None
     condition: Optional[Condition] = None
+
+class MagazinePreview(ItemPreview):
+    """Preview information for magazines"""
+    item_type: ItemType = ItemType.MAGAZINE
+    caliber: Optional[str] = None
+    capacity: Optional[int] = None
+
+class AmmunitionPreview(ItemPreview):
+    """Preview information for ammunition"""
+    item_type: ItemType = ItemType.AMMUNITION
+    caliber: Optional[str] = None
+    quantity: Optional[int] = None
 
 class ListingPreview(BaseModel):
     title: str = Field(description="The title of the listing")
     price: float = Field(description="The total price of the listing")
-    description: str = Field(description="The full description from the listing")
+    description: str = Field(description="The preview description from the listing")
     
-    # Preview items (simplified)
-    guns: Optional[List[GunPreview]] = Field(default=None)
+    # Preview items (can be any type)
+    items: List[ItemPreview] = Field(
+        default_factory=list,
+        description="List of items identified in the preview"
+    )
+    
+    # Legacy field for backward compatibility
+    guns: Optional[List[GunPreview]] = Field(
+        default=None,
+        description="DEPRECATED: Use items field instead"
+    )
+    
     listing_url: str = Field(description="URL of the detailed listing")
     image_urls: List[str] = Field(default_factory=list)
+
+    def __init__(self, **data):
+        super().__init__(**data)
+        # Convert legacy guns to items if present
+        if self.guns and not self.items:
+            self.items = [gun for gun in self.guns]
+            self.guns = None
 
 class ListingPreviews(BaseModel):
     listings: List[ListingPreview] = Field(description="List of all listing previews found on the page")
